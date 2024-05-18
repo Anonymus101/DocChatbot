@@ -1,285 +1,113 @@
-import os
-import logging
-import click
-import torch
-import utils
-from langchain.chains import RetrievalQA
-from langchain.embeddings import HuggingFaceInstructEmbeddings
-from langchain.llms import HuggingFacePipeline
-from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler  # for streaming response
-from langchain.callbacks.manager import CallbackManager
-
-callback_manager = CallbackManager([StreamingStdOutCallbackHandler()])
-
-from prompt_template_utils import get_prompt_template
-from utils import get_embeddings
-
-# from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-from langchain.vectorstores import Chroma
-from transformers import (
-    GenerationConfig,
-    pipeline,
-)
-
-from load_models import (
-    load_quantized_model_awq,
-    load_quantized_model_gguf_ggml,
-    load_quantized_model_qptq,
-    load_full_model,
-)
-
-from constants import (
-    EMBEDDING_MODEL_NAME,
-    PERSIST_DIRECTORY,
-    MODEL_ID,
-    MODEL_BASENAME,
-    MAX_NEW_TOKENS,
-    MODELS_PATH,
-    CHROMA_SETTINGS,
-)
+import PyPDF2
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain.chains import ConversationalRetrievalChain
+from langchain_community.chat_models import ChatOllama
+from langchain.memory import ChatMessageHistory, ConversationBufferMemory
+import chainlit as cl
 
 
-def load_model(device_type, model_id, model_basename=None, LOGGING=logging):
-    """
-    Select a model for text generation using the HuggingFace library.
-    If you are running this for the first time, it will download a model for you.
-    subsequent runs will use the model from the disk.
 
-    Args:
-        device_type (str): Type of device to use, e.g., "cuda" for GPU or "cpu" for CPU.
-        model_id (str): Identifier of the model to load from HuggingFace's model hub.
-        model_basename (str, optional): Basename of the model if using quantized models.
-            Defaults to None.
+@cl.on_chat_start
+async def on_chat_start():
+    files = None #Initialize variable to store uploaded files
 
-    Returns:
-        HuggingFacePipeline: A pipeline object for text generation using the loaded model.
+    # Wait for the user to upload a file
+    while files is None:
+        files = await cl.AskFileMessage(
+            content="Please upload a pdf file to begin!",
+            accept=["application/pdf"],
+            max_size_mb=100,# Optionally limit the file size
+            timeout=180, # Set a timeout for user response,
+        ).send()
 
-    Raises:
-        ValueError: If an unsupported model or device type is provided.
-    """
-    logging.info(f"Loading Model: {model_id}, on: {device_type}")
-    logging.info("This action can take a few minutes!")
-
-    if model_basename is not None:
-        if ".gguf" in model_basename.lower():
-            llm = load_quantized_model_gguf_ggml(model_id, model_basename, device_type, LOGGING)
-            return llm
-        elif ".ggml" in model_basename.lower():
-            model, tokenizer = load_quantized_model_gguf_ggml(model_id, model_basename, device_type, LOGGING)
-        elif ".awq" in model_basename.lower():
-            model, tokenizer = load_quantized_model_awq(model_id, LOGGING)
-        else:
-            model, tokenizer = load_quantized_model_qptq(model_id, model_basename, device_type, LOGGING)
-    else:
-        model, tokenizer = load_full_model(model_id, model_basename, device_type, LOGGING)
-
-    # Load configuration from the model to avoid warnings
-    generation_config = GenerationConfig.from_pretrained(model_id)
-    # see here for details:
-    # https://huggingface.co/docs/transformers/
-    # main_classes/text_generation#transformers.GenerationConfig.from_pretrained.returns
-
-    # Create a pipeline for text generation
-    pipe = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        max_length=MAX_NEW_TOKENS,
-        temperature=0.2,
-        # top_p=0.95,
-        repetition_penalty=1.15,
-        generation_config=generation_config,
-    )
-
-    local_llm = HuggingFacePipeline(pipeline=pipe)
-    logging.info("Local LLM Loaded")
-
-    return local_llm
-
-
-def retrieval_qa_pipline(device_type, use_history, promptTemplate_type="llama"):
-    """
-    Initializes and returns a retrieval-based Question Answering (QA) pipeline.
-
-    This function sets up a QA system that retrieves relevant information using embeddings
-    from the HuggingFace library. It then answers questions based on the retrieved information.
-
-    Parameters:
-    - device_type (str): Specifies the type of device where the model will run, e.g., 'cpu', 'cuda', etc.
-    - use_history (bool): Flag to determine whether to use chat history or not.
-
-    Returns:
-    - RetrievalQA: An initialized retrieval-based QA system.
-
-    Notes:
-    - The function uses embeddings from the HuggingFace library, either instruction-based or regular.
-    - The Chroma class is used to load a vector store containing pre-computed embeddings.
-    - The retriever fetches relevant documents or data based on a query.
-    - The prompt and memory, obtained from the `get_prompt_template` function, might be used in the QA system.
-    - The model is loaded onto the specified device using its ID and basename.
-    - The QA system retrieves relevant documents using the retriever and then answers questions based on those documents.
-    """
-
-    """
-    (1) Chooses an appropriate langchain library based on the enbedding model name.  Matching code is contained within ingest.py.
+    file = files[0] # Get the first uploaded file
+    print(file) # Print the file object for debugging
     
-    (2) Provides additional arguments for instructor and BGE models to improve results, pursuant to the instructions contained on
-    their respective huggingface repository, project page or github repository.
-    """
+     # Sending an image with the local file path
+    elements = [
+    cl.Image(name="image", display="inline", path="Docs/pic.png")
+    ]
+    # Inform the user that processing has started
+    msg = cl.Message(content=f"Processing `{file.name}`...",elements=elements)
+    await msg.send()
 
-    embeddings = get_embeddings(device_type)
+    # Read the PDF file
+    pdf = PyPDF2.PdfReader(file.path)
+    pdf_text = ""
+    for page in pdf.pages:
+        pdf_text += page.extract_text()
+        
 
-    logging.info(f"Loaded embeddings from {EMBEDDING_MODEL_NAME}")
+    # Split the text into chunks
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=50)
+    texts = text_splitter.split_text(pdf_text)
 
-    # load the vectorstore
-    db = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=embeddings, client_settings=CHROMA_SETTINGS)
-    retriever = db.as_retriever()
+    # Create a metadata for each chunk
+    metadatas = [{"source": f"{i}-pl"} for i in range(len(texts))]
 
-    # get the prompt template and memory if set by the user.
-    prompt, memory = get_prompt_template(promptTemplate_type=promptTemplate_type, history=use_history)
-
-    # load the llm pipeline
-    llm = load_model(device_type, model_id=MODEL_ID, model_basename=MODEL_BASENAME, LOGGING=logging)
-
-    if use_history:
-        qa = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",  # try other chains types as well. refine, map_reduce, map_rerank
-            retriever=retriever,
-            return_source_documents=True,  # verbose=True,
-            callbacks=callback_manager,
-            chain_type_kwargs={"prompt": prompt, "memory": memory},
-        )
-    else:
-        qa = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",  # try other chains types as well. refine, map_reduce, map_rerank
-            retriever=retriever,
-            return_source_documents=True,  # verbose=True,
-            callbacks=callback_manager,
-            chain_type_kwargs={
-                "prompt": prompt,
-            },
-        )
-
-    return qa
-
-
-# chose device typ to run on as well as to show source documents.
-@click.command()
-@click.option(
-    "--device_type",
-    default="cuda" if torch.cuda.is_available() else "cpu",
-    type=click.Choice(
-        [
-            "cpu",
-            "cuda",
-            "ipu",
-            "xpu",
-            "mkldnn",
-            "opengl",
-            "opencl",
-            "ideep",
-            "hip",
-            "ve",
-            "fpga",
-            "ort",
-            "xla",
-            "lazy",
-            "vulkan",
-            "mps",
-            "meta",
-            "hpu",
-            "mtia",
-        ],
-    ),
-    help="Device to run on. (Default is cuda)",
-)
-@click.option(
-    "--show_sources",
-    "-s",
-    is_flag=True,
-    help="Show sources along with answers (Default is False)",
-)
-@click.option(
-    "--use_history",
-    "-h",
-    is_flag=True,
-    help="Use history (Default is False)",
-)
-@click.option(
-    "--model_type",
-    default="llama3",
-    type=click.Choice(
-        ["llama3", "llama", "mistral", "non_llama"],
-    ),
-    help="model type, llama3, llama, mistral or non_llama",
-)
-@click.option(
-    "--save_qa",
-    is_flag=True,
-    help="whether to save Q&A pairs to a CSV file (Default is False)",
-)
-def main(device_type, show_sources, use_history, model_type, save_qa):
-    """
-    Implements the main information retrieval task for a localGPT.
-
-    This function sets up the QA system by loading the necessary embeddings, vectorstore, and LLM model.
-    It then enters an interactive loop where the user can input queries and receive answers. Optionally,
-    the source documents used to derive the answers can also be displayed.
-
-    Parameters:
-    - device_type (str): Specifies the type of device where the model will run, e.g., 'cpu', 'mps', 'cuda', etc.
-    - show_sources (bool): Flag to determine whether to display the source documents used for answering.
-    - use_history (bool): Flag to determine whether to use chat history or not.
-
-    Notes:
-    - Logging information includes the device type, whether source documents are displayed, and the use of history.
-    - If the models directory does not exist, it creates a new one to store models.
-    - The user can exit the interactive loop by entering "exit".
-    - The source documents are displayed if the show_sources flag is set to True.
-
-    """
-
-    logging.info(f"Running on: {device_type}")
-    logging.info(f"Display Source Documents set to: {show_sources}")
-    logging.info(f"Use history set to: {use_history}")
-
-    # check if models directory do not exist, create a new one and store models here.
-    if not os.path.exists(MODELS_PATH):
-        os.mkdir(MODELS_PATH)
-
-    qa = retrieval_qa_pipline(device_type, use_history, promptTemplate_type=model_type)
-    # Interactive questions and answers
-    while True:
-        query = input("\nEnter a query: ")
-        if query == "exit":
-            break
-        # Get the answer from the chain
-        res = qa(query)
-        answer, docs = res["result"], res["source_documents"]
-
-        # Print the result
-        print("\n\n> Question:")
-        print(query)
-        print("\n> Answer:")
-        print(answer)
-
-        if show_sources:  # this is a flag that you can set to disable showing answers.
-            # # Print the relevant sources used for the answer
-            print("----------------------------------SOURCE DOCUMENTS---------------------------")
-            for document in docs:
-                print("\n> " + document.metadata["source"] + ":")
-                print(document.page_content)
-            print("----------------------------------SOURCE DOCUMENTS---------------------------")
-
-        # Log the Q&A to CSV only if save_qa is True
-        if save_qa:
-            utils.log_to_csv(query, answer)
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)s - %(message)s", level=logging.INFO
+    # Create a Chroma vector store
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    docsearch = await cl.make_async(Chroma.from_texts)(
+        texts, embeddings, metadatas=metadatas
     )
-    main()
+    
+    # Initialize message history for conversation
+    message_history = ChatMessageHistory()
+    
+    # Memory for conversational context
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        output_key="answer",
+        chat_memory=message_history,
+        return_messages=True,
+    )
+
+    # Create a chain that uses the Chroma vector store
+    chain = ConversationalRetrievalChain.from_llm(
+        ChatOllama(model="llama3"),
+        chain_type="stuff",
+        retriever=docsearch.as_retriever(),
+        memory=memory,
+        return_source_documents=True,
+    )
+
+    # Let the user know that the system is ready
+    msg.content = f"Processing `{file.name}` done. You can now ask questions!"
+    await msg.update()
+    #store the chain in user session
+    cl.user_session.set("chain", chain)
+
+
+@cl.on_message
+async def main(message: cl.Message):
+     # Retrieve the chain from user session
+    chain = cl.user_session.get("chain") 
+    #call backs happens asynchronously/parallel 
+    cb = cl.AsyncLangchainCallbackHandler()
+    
+    # call the chain with user's message content
+    res = await chain.ainvoke(message.content, callbacks=[cb])
+    answer = res["answer"]
+    source_documents = res["source_documents"] 
+
+    text_elements = [] # Initialize list to store text elements
+    
+    # Process source documents if available
+    if source_documents:
+        for source_idx, source_doc in enumerate(source_documents):
+            source_name = f"source_{source_idx}"
+            # Create the text element referenced in the message
+            text_elements.append(
+                cl.Text(content=source_doc.page_content, name=source_name)
+            )
+        source_names = [text_el.name for text_el in text_elements]
+        
+         # Add source references to the answer
+        if source_names:
+            answer += f"\nSources: {', '.join(source_names)}"
+        else:
+            answer += "\nNo sources found"
+    #return results
+    await cl.Message(content=answer, elements=text_elements).send()
